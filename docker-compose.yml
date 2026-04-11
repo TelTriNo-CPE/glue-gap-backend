@@ -1,0 +1,63 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9091" --address ":9090"
+    ports:
+      - "9090:9090"
+      - "9091:9091"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    networks:
+      - glue-gap-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9090/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "3030:3030"
+    environment:
+      PORT: 3030
+      MINIO_ENDPOINT: http://minio:9090
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: glue-analysis
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - glue-gap-net
+
+  image-processor:
+    build:
+      context: ./image-processor
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9090
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: glue-analysis
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - glue-gap-net
+
+volumes:
+  minio_data:
+
+networks:
+  glue-gap-net:
+    driver: bridge
