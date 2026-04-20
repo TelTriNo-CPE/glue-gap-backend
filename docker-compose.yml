@@ -43,6 +43,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    volumes:
+      # Bind-mount source so edits take effect on container restart (no rebuild needed)
+      - ./image-processor/app:/app/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
     environment:
       MINIO_ENDPOINT: minio
       MINIO_PORT: 9090

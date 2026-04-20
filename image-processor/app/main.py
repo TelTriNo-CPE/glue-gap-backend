@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +27,9 @@ app = FastAPI(title="image-processor")
 BUCKET = os.environ.get("MINIO_BUCKET", "glue-analysis")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 IMAGE_EXTENSIONS = {".tiff", ".tif", ".png", ".jpg", ".jpeg", ".svs", ".ndpi"}
-MIN_GAP_AREA_PX = float(os.environ.get("MIN_GAP_AREA_PX", "10"))
+MIN_GAP_AREA_PX       = float(os.environ.get("MIN_GAP_AREA_PX", "50"))        # absolute floor in px²
+POLY_SIMPLIFY_EPSILON = float(os.environ.get("POLY_SIMPLIFY_EPSILON", "0.015")) # fraction of arc length
+GAP_PAYLOAD_LIMIT     = int(os.environ.get("GAP_PAYLOAD_LIMIT", "2000"))        # max gaps sent to frontend
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "60"))
 RETENTION_SECONDS = int(os.environ.get("RETENTION_SECONDS", "3600"))
 
@@ -102,13 +105,15 @@ def process_image(client: Minio, object_name: str):
         dzi_file = tmp_path / f"{stem}.dzi"
         tiles_dir = tmp_path / f"{stem}_files"
 
+        # Upload tile images BEFORE the DZI descriptor so the frontend never
+        # sees the descriptor without its tiles (avoids a 404 race condition).
+        upload_directory(client, tiles_dir, f"tiles/{stem}/{stem}_files")
         client.fput_object(
             BUCKET,
             f"tiles/{stem}/{stem}.dzi",
             str(dzi_file),
             content_type="application/xml",
         )
-        upload_directory(client, tiles_dir, f"tiles/{stem}/{stem}_files")
 
     logger.info("Done tiling %s", object_name)
 
@@ -121,10 +126,26 @@ def analyze_gaps(client: Minio, object_name: str):
         return None
 
     if result_exists(client, stem):
-        logger.info("Gap analysis already exists for %s, skipping", stem)
-        return None
+        # Schema migration: if the cached result is missing the 'coordinates' field
+        # (generated before this field was added), invalidate it so it is re-analysed.
+        try:
+            cached = fetch_result(client, stem)
+            first_gap = (cached.get("gaps") or [{}])[0]
+            if "coordinates" not in first_gap:
+                logger.info(
+                    "Cached result for %s is stale (no 'coordinates') — re-analysing", stem
+                )
+                client.remove_object(BUCKET, f"results/{stem}.json")
+                # fall through to re-analyse
+            else:
+                logger.info("Gap analysis already exists for %s, skipping", stem)
+                return None
+        except Exception:
+            logger.info("Could not validate cached result for %s — re-analysing", stem)
+            # fall through to re-analyse
 
-    logger.info("Analyzing gaps for %s", object_name)
+    logger.info("Analyzing gaps for %s — starting", object_name)
+    t_start = time.time()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -138,46 +159,98 @@ def analyze_gaps(client: Minio, object_name: str):
             logger.warning("cv2.imread returned None for %s, skipping", object_name)
             return None
         h, w = img.shape[:2]
+        if w == 0 or h == 0:
+            logger.warning("Zero-dimension image for %s, skipping", object_name)
+            return None
 
+        # Dynamic noise floor: scales with image area so that microscopic noise
+        # contours are suppressed proportionally on high-resolution images.
+        # Formula: 1 px² floor per 40,000 image pixels, but never below MIN_GAP_AREA_PX.
+        # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
+        min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
+
+        # --- Threshold ---
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # CHAIN_APPROX_NONE retains every boundary pixel so approxPolyDP has
+        # the full shape to work with before aggressive simplification.
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        # --- Per-contour processing ---
         gaps = []
         for cnt in contours:
             area_px = float(cv2.contourArea(cnt))
-            if area_px < MIN_GAP_AREA_PX:
+
+            # Strict noise filter (dynamic threshold)
+            if area_px < min_area:
                 continue
+
+            # Aggressive simplification — epsilon ≈ 1.5 % of arc length.
+            # A 200-point raw contour typically collapses to 8–15 vertices while
+            # retaining the overall gap outline.
+            perimeter = cv2.arcLength(cnt, True)
+            epsilon = POLY_SIMPLIFY_EPSILON * perimeter if perimeter > 0 else 1.0
+            simplified = cv2.approxPolyDP(cnt, epsilon, True)
+
+            # Equivalent radius — useful for size-distribution statistics
             equiv_radius_px = math.sqrt(area_px / math.pi)
+
+            # Centroid via image moments; fall back to bounding-box centre
             m = cv2.moments(cnt)
             if m["m00"] != 0:
                 cx = m["m10"] / m["m00"]
                 cy = m["m01"] / m["m00"]
             else:
-                x, y, bw, bh = cv2.boundingRect(cnt)
-                cx = x + bw / 2
-                cy = y + bh / 2
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+
+            # Flat normalized coordinate array [x1_norm, y1_norm, x2_norm, y2_norm, …]
+            # Normalised to [0, 1] so the frontend scales to any viewport without
+            # needing the original pixel dimensions; eliminates per-vertex JSON keys.
+            pts = simplified.reshape(-1, 2)
+            coordinates: list[float] = []
+            for pt in pts:
+                coordinates.append(round(float(pt[0]) / w, 4))
+                coordinates.append(round(float(pt[1]) / h, 4))
+
             gaps.append({
-                "area_px": area_px,
-                "equiv_radius_px": equiv_radius_px,
-                "centroid_norm": [cx / w, cy / h],
+                "area_px":         round(area_px, 1),
+                "equiv_radius_px": round(equiv_radius_px, 2),
+                "centroid_norm":   [round(cx / w, 4), round(cy / h, 4)],
+                "coordinates":     coordinates,
             })
 
-        radii = [g["equiv_radius_px"] for g in gaps]
-        radius_stats = {
-            "min": float(np.min(radii)),
-            "max": float(np.max(radii)),
-            "mean": float(np.mean(radii)),
-            "median": float(np.median(radii)),
-            "std": float(np.std(radii)),
-        } if radii else None
+        total_gap_count = len(gaps)
+        logger.info(
+            "  %s: %d contours passed noise filter (min_area=%.1f px²)",
+            stem, total_gap_count, min_area,
+        )
+
+        # --- Statistics over ALL valid gaps (computed before the payload cap) ---
+        if gaps:
+            radii = [g["equiv_radius_px"] for g in gaps]
+            radius_stats: dict | None = {
+                "min":    round(float(np.min(radii)),    2),
+                "max":    round(float(np.max(radii)),    2),
+                "mean":   round(float(np.mean(radii)),   2),
+                "median": round(float(np.median(radii)), 2),
+                "std":    round(float(np.std(radii)),    2),
+            }
+        else:
+            radius_stats = None
+
+        # --- Hard payload cap: largest gaps first, frontend receives at most GAP_PAYLOAD_LIMIT ---
+        gaps.sort(key=lambda g: g["area_px"], reverse=True)
+        payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "stem": stem,
-            "image_size": {"width": w, "height": h},
-            "gap_count": len(gaps),
-            "gaps": gaps,
-            "radius_stats": radius_stats,
+            "stem":         stem,
+            "image_size":   {"width": w, "height": h},
+            "gap_count":    total_gap_count,   # all valid gaps, not capped
+            "gaps":         payload_gaps,       # top GAP_PAYLOAD_LIMIT by area
+            "radius_stats": radius_stats,       # stats over all valid gaps
         }
 
         data = json.dumps(result).encode("utf-8")
@@ -189,7 +262,11 @@ def analyze_gaps(client: Minio, object_name: str):
             content_type="application/json",
         )
 
-    logger.info("Gap analysis done for %s: %d gaps found", object_name, len(gaps))
+    elapsed = time.time() - t_start
+    logger.info(
+        "Gap analysis done for %s: %d total, %d returned (cap=%d), %.1fs elapsed",
+        object_name, total_gap_count, len(payload_gaps), GAP_PAYLOAD_LIMIT, elapsed,
+    )
     return result
 
 
@@ -408,6 +485,11 @@ async def poll_loop():
 
 @app.on_event("startup")
 async def startup():
+    logger.info(
+        "image-processor STARTED — MIN_GAP_AREA_PX=%.0f  GAP_PAYLOAD_LIMIT=%d  "
+        "POLY_SIMPLIFY_EPSILON=%.3f  (coordinates field: ENABLED)",
+        MIN_GAP_AREA_PX, GAP_PAYLOAD_LIMIT, POLY_SIMPLIFY_EPSILON,
+    )
     asyncio.create_task(poll_loop())
     asyncio.create_task(cleanup_loop())
 
@@ -449,18 +531,52 @@ class AnalyzeRequest(BaseModel):
     key: str
 
 
-@app.post("/analyze-gaps")
+class GapItem(BaseModel):
+    area_px: float
+    equiv_radius_px: float
+    centroid_norm: list[float]
+    coordinates: list[float]   # flat [x1_norm, y1_norm, x2_norm, y2_norm, …]
+
+
+class RadiusStats(BaseModel):
+    min: float
+    max: float
+    mean: float
+    median: float
+    std: float
+
+
+class ImageSize(BaseModel):
+    width: int
+    height: int
+
+
+class AnalysisResult(BaseModel):
+    stem: str
+    image_size: ImageSize
+    gap_count: int
+    gaps: list[GapItem]
+    radius_stats: RadiusStats | None
+
+
+@app.post("/analyze-gaps", response_model=AnalysisResult)
 async def analyze_gaps_endpoint(body: AnalyzeRequest):
     client = get_minio_client()
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, analyze_gaps, client, body.key)
-    if result is None:
-        stem = Path(body.key).stem
-        try:
-            return await loop.run_in_executor(None, fetch_result, client, stem)
-        except S3Error:
-            raise HTTPException(status_code=404, detail=f"No result found for {stem}")
-    return result
+    try:
+        result = await loop.run_in_executor(None, analyze_gaps, client, body.key)
+        if result is None:
+            stem = Path(body.key).stem
+            try:
+                return await loop.run_in_executor(None, fetch_result, client, stem)
+            except S3Error:
+                raise HTTPException(status_code=404, detail=f"No result found for {stem}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled error in /analyze-gaps for %s", body.key)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/results")
