@@ -28,7 +28,7 @@ BUCKET = os.environ.get("MINIO_BUCKET", "glue-analysis")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 IMAGE_EXTENSIONS = {".tiff", ".tif", ".png", ".jpg", ".jpeg", ".svs", ".ndpi"}
 MIN_GAP_AREA_PX       = float(os.environ.get("MIN_GAP_AREA_PX", "50"))        # absolute floor in px²
-POLY_SIMPLIFY_EPSILON = float(os.environ.get("POLY_SIMPLIFY_EPSILON", "0.015")) # fraction of arc length
+POLY_SIMPLIFY_EPSILON = float(os.environ.get("POLY_SIMPLIFY_EPSILON", "0.002")) # fraction of arc length
 GAP_PAYLOAD_LIMIT     = int(os.environ.get("GAP_PAYLOAD_LIMIT", "2000"))        # max gaps sent to frontend
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "60"))
 RETENTION_SECONDS = int(os.environ.get("RETENTION_SECONDS", "3600"))
@@ -126,14 +126,19 @@ def analyze_gaps(client: Minio, object_name: str):
         return None
 
     if result_exists(client, stem):
-        # Schema migration: if the cached result is missing the 'coordinates' field
-        # (generated before this field was added), invalidate it so it is re-analysed.
+        # Schema migration: invalidate cached results that are stale —
+        # missing 'coordinates' (pre-Phase 3) or missing 'version' (pre-v2,
+        # generated with the coarse 0.015 epsilon).
         try:
             cached = fetch_result(client, stem)
             first_gap = (cached.get("gaps") or [{}])[0]
-            if "coordinates" not in first_gap:
+            needs_refresh = (
+                "coordinates" not in first_gap
+                or cached.get("version", 0) < 2
+            )
+            if needs_refresh:
                 logger.info(
-                    "Cached result for %s is stale (no 'coordinates') — re-analysing", stem
+                    "Cached result for %s is stale — re-analysing", stem
                 )
                 client.remove_object(BUCKET, f"results/{stem}.json")
                 # fall through to re-analyse
@@ -173,8 +178,15 @@ def analyze_gaps(client: Minio, object_name: str):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+        # Morphological opening removes thin noise tendrils that bleed into
+        # surrounding rock, then closing fills small internal holes so
+        # contours hug the true gap boundary more tightly.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+
         # CHAIN_APPROX_NONE retains every boundary pixel so approxPolyDP has
-        # the full shape to work with before aggressive simplification.
+        # the full shape to work with before fine-grained simplification.
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
         # --- Per-contour processing ---
@@ -186,9 +198,9 @@ def analyze_gaps(client: Minio, object_name: str):
             if area_px < min_area:
                 continue
 
-            # Aggressive simplification — epsilon ≈ 1.5 % of arc length.
-            # A 200-point raw contour typically collapses to 8–15 vertices while
-            # retaining the overall gap outline.
+            # Fine-grained simplification — epsilon ≈ 0.2 % of arc length.
+            # Produces high-fidelity polygons that hug the organic gap edges
+            # closely, at the cost of more vertices per contour.
             perimeter = cv2.arcLength(cnt, True)
             epsilon = POLY_SIMPLIFY_EPSILON * perimeter if perimeter > 0 else 1.0
             simplified = cv2.approxPolyDP(cnt, epsilon, True)
@@ -246,6 +258,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
+            "version":      2,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -375,8 +388,13 @@ def generate_annotated_image(client: Minio, object_name: str):
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filtered = [cnt for cnt in contours if cv2.contourArea(cnt) >= MIN_GAP_AREA_PX]
+        h_ann, w_ann = img.shape[:2]
+        min_area_ann = max(MIN_GAP_AREA_PX, (w_ann * h_ann) / 40_000)
+        filtered = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area_ann]
         cv2.drawContours(img, filtered, -1, (0, 0, 255), 2)
 
         lo, hi, best_buf = 1, 95, None
