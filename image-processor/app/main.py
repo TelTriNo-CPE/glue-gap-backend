@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 5
+                or cached.get("version", 0) < 6
             )
             if needs_refresh:
                 logger.info(
@@ -174,19 +174,25 @@ def analyze_gaps(client: Minio, object_name: str):
         # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
         min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
 
-        # --- Illumination correction (CLAHE) + Global Otsu ---
-        # CLAHE flattens uneven lighting so Otsu can find a single global
-        # threshold that captures entire solid dark regions without hollowing.
+        # --- Illumination correction (CLAHE) + strict adaptive threshold ---
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
-        # Bilateral filter smooths noise inside gaps while preserving sharp
-        # edges and corners — unlike Gaussian blur which rounds them off.
+        # Bilateral filter smooths noise while preserving sharp edges.
         gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Large-block adaptive threshold: strict local evaluation that
+        # isolates only genuinely dark regions without the hollowing effect
+        # (blockSize large enough to span entire gaps).
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=201,
+            C=15,
+        )
 
-        # Morphological opening removes thin noise tendrils; closing with a
-        # minimal 3×3 kernel heals internal specks without dilating edges.
+        # Opening disconnects thin noise bridges that merge separate gaps
+        # into one giant blob; closing heals small internal specks.
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, morph_kernel, iterations=1)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
@@ -196,12 +202,16 @@ def analyze_gaps(client: Minio, object_name: str):
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
         # --- Per-contour processing ---
+        max_area = 0.25 * w * h  # 25% of image area — anything larger is a bleed
         gaps = []
         for cnt in contours:
             area_px = float(cv2.contourArea(cnt))
 
             # Strict noise filter (dynamic threshold)
             if area_px < min_area:
+                continue
+            # Discard unrealistically large contours (false-positive bleeds)
+            if area_px > max_area:
                 continue
 
             # Fine-grained simplification — epsilon ≈ 0.2 % of arc length.
@@ -264,7 +274,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      5,                  # bump when pipeline changes
+            "version":      6,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -396,14 +406,22 @@ def generate_annotated_image(client: Minio, object_name: str):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=201,
+            C=15,
+        )
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, morph_kernel, iterations=1)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, morph_kernel, iterations=1)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         h_ann, w_ann = img.shape[:2]
         min_area_ann = max(MIN_GAP_AREA_PX, (w_ann * h_ann) / 40_000)
-        filtered = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area_ann]
+        max_area_ann = 0.25 * w_ann * h_ann
+        filtered = [cnt for cnt in contours
+                    if min_area_ann <= cv2.contourArea(cnt) <= max_area_ann]
         cv2.drawContours(img, filtered, -1, (0, 0, 255), 2)
 
         lo, hi, best_buf = 1, 95, None
