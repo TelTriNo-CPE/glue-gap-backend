@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 2
+                or cached.get("version", 0) < 3
             )
             if needs_refresh:
                 logger.info(
@@ -174,16 +174,32 @@ def analyze_gaps(client: Minio, object_name: str):
         # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
         min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
 
-        # --- Threshold ---
+        # --- Illumination correction (CLAHE) ---
+        # Normalizes uneven lighting at the edges of the rock core and
+        # enhances the contrast of faint gaps before thresholding.
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # --- Adaptive thresholding ---
+        # Local thresholds calculated over small regions solve the uneven
+        # lighting / shadow issue at image boundaries that global Otsu misses.
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=51,   # neighbourhood size (must be odd)
+            C=15,           # constant subtracted from the local mean
+        )
 
         # Morphological opening removes thin noise tendrils that bleed into
-        # surrounding rock, then closing fills small internal holes so
-        # contours hug the true gap boundary more tightly.
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # surrounding rock, then closing with a larger kernel bridges tiny
+        # bright spots (noise/dust) inside large dark regions, preventing
+        # large gaps from fracturing into many small pieces.
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel, iterations=1)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
         # CHAIN_APPROX_NONE retains every boundary pixel so approxPolyDP has
         # the full shape to work with before fine-grained simplification.
@@ -258,7 +274,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      2,                  # bump when pipeline changes
+            "version":      3,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -387,10 +403,19 @@ def generate_annotated_image(client: Minio, object_name: str):
             return None
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=51,
+            C=15,
+        )
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel, iterations=1)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         h_ann, w_ann = img.shape[:2]
         min_area_ann = max(MIN_GAP_AREA_PX, (w_ann * h_ann) / 40_000)
