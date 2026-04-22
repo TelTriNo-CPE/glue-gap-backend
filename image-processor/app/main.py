@@ -27,7 +27,7 @@ app = FastAPI(title="image-processor")
 BUCKET = os.environ.get("MINIO_BUCKET", "glue-analysis")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 IMAGE_EXTENSIONS = {".tiff", ".tif", ".png", ".jpg", ".jpeg", ".svs", ".ndpi"}
-MIN_GAP_AREA_PX       = float(os.environ.get("MIN_GAP_AREA_PX", "50"))        # absolute floor in px²
+MIN_GAP_AREA_PX       = float(os.environ.get("MIN_GAP_AREA_PX", "20"))        # absolute floor in px²
 POLY_SIMPLIFY_EPSILON = float(os.environ.get("POLY_SIMPLIFY_EPSILON", "0.001")) # fraction of arc length
 GAP_PAYLOAD_LIMIT     = int(os.environ.get("GAP_PAYLOAD_LIMIT", "2000"))        # max gaps sent to frontend
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "60"))
@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 6
+                or cached.get("version", 0) < 7
             )
             if needs_refresh:
                 logger.info(
@@ -176,19 +176,18 @@ def analyze_gaps(client: Minio, object_name: str):
 
         # --- Illumination correction (CLAHE) + strict adaptive threshold ---
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         # Bilateral filter smooths noise while preserving sharp edges.
         gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-        # Large-block adaptive threshold: strict local evaluation that
-        # isolates only genuinely dark regions without the hollowing effect
-        # (blockSize large enough to span entire gaps).
+        # Large-block adaptive threshold: blockSize large enough to prevent
+        # hollowing; low C value to stay sensitive to faint thin veins.
         thresh = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
             blockSize=201,
-            C=15,
+            C=5,
         )
 
         # Opening disconnects thin noise bridges that merge separate gaps
@@ -274,7 +273,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      6,                  # bump when pipeline changes
+            "version":      7,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -403,7 +402,7 @@ def generate_annotated_image(client: Minio, object_name: str):
             return None
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
         thresh = cv2.adaptiveThreshold(
@@ -411,7 +410,7 @@ def generate_annotated_image(client: Minio, object_name: str):
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
             blockSize=201,
-            C=15,
+            C=5,
         )
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, morph_kernel, iterations=1)
