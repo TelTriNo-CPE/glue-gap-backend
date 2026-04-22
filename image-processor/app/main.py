@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 3
+                or cached.get("version", 0) < 4
             )
             if needs_refresh:
                 logger.info(
@@ -174,23 +174,14 @@ def analyze_gaps(client: Minio, object_name: str):
         # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
         min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
 
-        # --- Illumination correction (CLAHE) ---
-        # Normalizes uneven lighting at the edges of the rock core and
-        # enhances the contrast of faint gaps before thresholding.
+        # --- Illumination correction (CLAHE) + Global Otsu ---
+        # CLAHE flattens uneven lighting so Otsu can find a single global
+        # threshold that captures entire solid dark regions without hollowing.
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
-
-        # --- Adaptive thresholding ---
-        # Local thresholds calculated over small regions solve the uneven
-        # lighting / shadow issue at image boundaries that global Otsu misses.
-        thresh = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            blockSize=51,   # neighbourhood size (must be odd)
-            C=15,           # constant subtracted from the local mean
-        )
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
         # Morphological opening removes thin noise tendrils that bleed into
         # surrounding rock, then closing with a larger kernel bridges tiny
@@ -274,7 +265,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      3,                  # bump when pipeline changes
+            "version":      4,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -405,13 +396,8 @@ def generate_annotated_image(client: Minio, object_name: str):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
-        thresh = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            blockSize=51,
-            C=15,
-        )
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel, iterations=1)
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
