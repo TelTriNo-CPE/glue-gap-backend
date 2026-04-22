@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 9
+                or cached.get("version", 0) < 10
             )
             if needs_refresh:
                 logger.info(
@@ -174,40 +174,30 @@ def analyze_gaps(client: Minio, object_name: str):
         # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
         min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
 
-        # --- HSV color-based hybrid segmentation ---
-        blurred = cv2.GaussianBlur(img, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        # --- Background-division illumination normalization ---
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-        # Mask 1 — Greenish/porous resin: target green-cyan hues with
-        # moderate saturation & brightness.
-        mask_green = cv2.inRange(
-            hsv,
-            np.array([35, 40, 40]),    # lower H, S, V
-            np.array([85, 255, 255]),  # upper H, S, V
+        # Fast background estimation: downscale → large morphological close
+        # → upscale.  The close fills in dark gaps so the result is a smooth
+        # approximation of the rock's illumination field only.
+        small_gray = cv2.resize(gray, None, fx=0.1, fy=0.1,
+                                interpolation=cv2.INTER_AREA)
+        bg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        small_bg = cv2.morphologyEx(small_gray, cv2.MORPH_CLOSE, bg_kernel)
+        bg = cv2.resize(small_bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Divide original by background: rock becomes ~255 (white), gaps
+        # stay distinctly dark — lighting variations are erased.
+        norm = cv2.divide(gray, bg, scale=255)
+
+        # Global Otsu on the now-flat-lit image — no hollowing, no bleeding.
+        _, thresh = cv2.threshold(
+            norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
         )
 
-        # Mask 2 — Black & faint dark gaps: low Value regardless of Hue,
-        # combined with adaptive threshold on CLAHE-enhanced V channel to
-        # catch faint dark lines and small black zones.
-        v_channel = hsv[:, :, 2]
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        v_enhanced = clahe.apply(v_channel)
-
-        mask_dark_global = cv2.inRange(v_channel, 0, 80)
-        mask_dark_adaptive = cv2.adaptiveThreshold(
-            v_enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            blockSize=151,
-            C=3,
-        )
-        mask_dark = cv2.bitwise_or(mask_dark_global, mask_dark_adaptive)
-
-        # Combine green + dark masks.
-        thresh = cv2.bitwise_or(mask_green, mask_dark)
-
-        # Closing fuses porous/fibrous holes inside green areas into solid
-        # blobs; minimal opening removes single-pixel dust.
+        # Closing fuses porous regions into solid blobs; opening removes
+        # single-pixel dust.
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -290,7 +280,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      9,                  # bump when pipeline changes
+            "version":      10,                 # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -418,32 +408,25 @@ def generate_annotated_image(client: Minio, object_name: str):
             logger.warning("cv2.imread returned None for %s", object_name)
             return None
 
-        blurred = cv2.GaussianBlur(img, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        mask_green = cv2.inRange(
-            hsv, np.array([35, 40, 40]), np.array([85, 255, 255]),
+        h_img, w_img = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        small_gray = cv2.resize(gray, None, fx=0.1, fy=0.1,
+                                interpolation=cv2.INTER_AREA)
+        bg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        small_bg = cv2.morphologyEx(small_gray, cv2.MORPH_CLOSE, bg_kernel)
+        bg = cv2.resize(small_bg, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
+        norm = cv2.divide(gray, bg, scale=255)
+        _, thresh = cv2.threshold(
+            norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
         )
-        v_channel = hsv[:, :, 2]
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        v_enhanced = clahe.apply(v_channel)
-        mask_dark_global = cv2.inRange(v_channel, 0, 80)
-        mask_dark_adaptive = cv2.adaptiveThreshold(
-            v_enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            blockSize=151,
-            C=3,
-        )
-        mask_dark = cv2.bitwise_or(mask_dark_global, mask_dark_adaptive)
-        thresh = cv2.bitwise_or(mask_green, mask_dark)
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel, iterations=1)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        h_ann, w_ann = img.shape[:2]
-        min_area_ann = max(MIN_GAP_AREA_PX, (w_ann * h_ann) / 40_000)
-        max_area_ann = 0.25 * w_ann * h_ann
+        min_area_ann = max(MIN_GAP_AREA_PX, (w_img * h_img) / 40_000)
+        max_area_ann = 0.25 * w_img * h_img
         filtered = [cnt for cnt in contours
                     if min_area_ann <= cv2.contourArea(cnt) <= max_area_ann]
         cv2.drawContours(img, filtered, -1, (0, 0, 255), 2)
