@@ -134,7 +134,7 @@ def analyze_gaps(client: Minio, object_name: str):
             first_gap = (cached.get("gaps") or [{}])[0]
             needs_refresh = (
                 "coordinates" not in first_gap
-                or cached.get("version", 0) < 8
+                or cached.get("version", 0) < 9
             )
             if needs_refresh:
                 logger.info(
@@ -174,33 +174,40 @@ def analyze_gaps(client: Minio, object_name: str):
         # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
         min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
 
-        # --- Hybrid dual-masking (Otsu + Adaptive) ---
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        # --- HSV color-based hybrid segmentation ---
+        blurred = cv2.GaussianBlur(img, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        # Mask 1 — Macro & mid-tones: Gaussian blur + global Otsu catches
-        # large solid black gaps and darker greenish/porous regions.
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask_macro = cv2.threshold(
-            blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        # Mask 1 — Greenish/porous resin: target green-cyan hues with
+        # moderate saturation & brightness.
+        mask_green = cv2.inRange(
+            hsv,
+            np.array([35, 40, 40]),    # lower H, S, V
+            np.array([85, 255, 255]),  # upper H, S, V
         )
 
-        # Mask 2 — Micro & veins: adaptive threshold on the un-blurred
-        # CLAHE image recovers thin hair-like veins that Otsu misses.
-        mask_micro = cv2.adaptiveThreshold(
-            gray, 255,
+        # Mask 2 — Black & faint dark gaps: low Value regardless of Hue,
+        # combined with adaptive threshold on CLAHE-enhanced V channel to
+        # catch faint dark lines and small black zones.
+        v_channel = hsv[:, :, 2]
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        v_enhanced = clahe.apply(v_channel)
+
+        mask_dark_global = cv2.inRange(v_channel, 0, 80)
+        mask_dark_adaptive = cv2.adaptiveThreshold(
+            v_enhanced, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
             blockSize=151,
             C=3,
         )
+        mask_dark = cv2.bitwise_or(mask_dark_global, mask_dark_adaptive)
 
-        # Combine both masks so nothing is lost.
-        thresh = cv2.bitwise_or(mask_macro, mask_micro)
+        # Combine green + dark masks.
+        thresh = cv2.bitwise_or(mask_green, mask_dark)
 
-        # Closing fuses porous holes inside greenish areas into solid blobs;
-        # opening removes single-pixel noise bridges.
+        # Closing fuses porous/fibrous holes inside green areas into solid
+        # blobs; minimal opening removes single-pixel dust.
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -283,7 +290,7 @@ def analyze_gaps(client: Minio, object_name: str):
         payload_gaps = gaps[:GAP_PAYLOAD_LIMIT]
 
         result = {
-            "version":      8,                  # bump when pipeline changes
+            "version":      9,                  # bump when pipeline changes
             "stem":         stem,
             "image_size":   {"width": w, "height": h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
@@ -411,21 +418,24 @@ def generate_annotated_image(client: Minio, object_name: str):
             logger.warning("cv2.imread returned None for %s", object_name)
             return None
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, mask_macro = cv2.threshold(
-            blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        blurred = cv2.GaussianBlur(img, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        mask_green = cv2.inRange(
+            hsv, np.array([35, 40, 40]), np.array([85, 255, 255]),
         )
-        mask_micro = cv2.adaptiveThreshold(
-            gray, 255,
+        v_channel = hsv[:, :, 2]
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        v_enhanced = clahe.apply(v_channel)
+        mask_dark_global = cv2.inRange(v_channel, 0, 80)
+        mask_dark_adaptive = cv2.adaptiveThreshold(
+            v_enhanced, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
             blockSize=151,
             C=3,
         )
-        thresh = cv2.bitwise_or(mask_macro, mask_micro)
+        mask_dark = cv2.bitwise_or(mask_dark_global, mask_dark_adaptive)
+        thresh = cv2.bitwise_or(mask_green, mask_dark)
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
