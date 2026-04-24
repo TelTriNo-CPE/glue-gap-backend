@@ -31,6 +31,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: glue-analysis
+      IMAGE_PROCESSOR_URL: http://image-processor:8080
     depends_on:
       minio:
         condition: service_healthy

@@ -118,14 +118,18 @@ def process_image(client: Minio, object_name: str):
     logger.info("Done tiling %s", object_name)
 
 
-def analyze_gaps(client: Minio, object_name: str):
+def analyze_gaps(client: Minio, object_name: str,
+                  sensitivity: float = 50.0, min_area_param: float = 20.0):
     stem = Path(object_name).stem
     ext = Path(object_name).suffix.lower()
 
     if ext not in IMAGE_EXTENSIONS:
         return None
 
-    if result_exists(client, stem):
+    # Custom params → always re-run (no cache), default → use cache as before
+    use_cache = (sensitivity == 50.0 and min_area_param == 20.0)
+
+    if use_cache and result_exists(client, stem):
         # Schema migration: invalidate cached results that are stale —
         # missing 'coordinates' (pre-Phase 3) or missing 'version' (pre-v2,
         # generated with the coarse 0.015 epsilon).
@@ -170,9 +174,8 @@ def analyze_gaps(client: Minio, object_name: str):
 
         # Dynamic noise floor: scales with image area so that microscopic noise
         # contours are suppressed proportionally on high-resolution images.
-        # Formula: 1 px² floor per 40,000 image pixels, but never below MIN_GAP_AREA_PX.
-        # e.g. 4 000×4 000 → 400 px²;  2 000×2 000 → 100 px²;  1 000×1 000 → 50 px²
-        min_area = max(MIN_GAP_AREA_PX, (w * h) / 40_000)
+        # Uses the caller-provided min_area_param as the absolute floor.
+        min_area = max(min_area_param, (w * h) / 40_000)
 
         # --- Background-division illumination normalization ---
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -191,10 +194,14 @@ def analyze_gaps(client: Minio, object_name: str):
         # stay distinctly dark — lighting variations are erased.
         norm = cv2.divide(gray, bg, scale=255)
 
-        # Global Otsu on the now-flat-lit image — no hollowing, no bleeding.
-        _, thresh = cv2.threshold(
-            norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-        )
+        # Get Otsu's optimal threshold without applying it, then adjust
+        # based on the sensitivity parameter (50 = baseline Otsu).
+        # Higher sensitivity → higher threshold → catches lighter (subtler) gaps.
+        # Lower sensitivity → lower threshold → only very dark gaps detected.
+        T, _ = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        offset = (sensitivity - 50) * 1.5
+        adjusted_T = max(0, min(255, T + offset))
+        _, thresh = cv2.threshold(norm, adjusted_T, 255, cv2.THRESH_BINARY_INV)
 
         # Closing fuses porous regions into solid blobs; opening removes
         # single-pixel dust.
@@ -286,21 +293,28 @@ def analyze_gaps(client: Minio, object_name: str):
             "gap_count":    total_gap_count,   # all valid gaps, not capped
             "gaps":         payload_gaps,       # top GAP_PAYLOAD_LIMIT by area
             "radius_stats": radius_stats,       # stats over all valid gaps
+            "sensitivity":  sensitivity,
+            "min_area":     min_area_param,
         }
 
-        data = json.dumps(result).encode("utf-8")
-        client.put_object(
-            BUCKET,
-            f"results/{stem}.json",
-            io.BytesIO(data),
-            length=len(data),
-            content_type="application/json",
-        )
+        # Only persist to MinIO when using default params (poll-loop / first run).
+        # Custom-param runs return results directly without overwriting the cache.
+        if use_cache:
+            data = json.dumps(result).encode("utf-8")
+            client.put_object(
+                BUCKET,
+                f"results/{stem}.json",
+                io.BytesIO(data),
+                length=len(data),
+                content_type="application/json",
+            )
 
     elapsed = time.time() - t_start
     logger.info(
-        "Gap analysis done for %s: %d total, %d returned (cap=%d), %.1fs elapsed",
-        object_name, total_gap_count, len(payload_gaps), GAP_PAYLOAD_LIMIT, elapsed,
+        "Gap analysis done for %s: %d total, %d returned (cap=%d), "
+        "sensitivity=%.0f, min_area=%.0f, %.1fs elapsed",
+        object_name, total_gap_count, len(payload_gaps), GAP_PAYLOAD_LIMIT,
+        sensitivity, min_area_param, elapsed,
     )
     return result
 
@@ -581,6 +595,8 @@ def list_tiles():
 
 class AnalyzeRequest(BaseModel):
     key: str
+    sensitivity: float = 50.0
+    min_area: float = 20.0
 
 
 class GapItem(BaseModel):
@@ -609,6 +625,8 @@ class AnalysisResult(BaseModel):
     gap_count: int
     gaps: list[GapItem]
     radius_stats: RadiusStats | None
+    sensitivity: float | None = None
+    min_area: float | None = None
 
 
 @app.post("/analyze-gaps", response_model=AnalysisResult)
@@ -616,7 +634,10 @@ async def analyze_gaps_endpoint(body: AnalyzeRequest):
     client = get_minio_client()
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(None, analyze_gaps, client, body.key)
+        result = await loop.run_in_executor(
+            None, analyze_gaps, client, body.key,
+            body.sensitivity, body.min_area,
+        )
         if result is None:
             stem = Path(body.key).stem
             try:
