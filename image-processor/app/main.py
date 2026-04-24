@@ -172,6 +172,26 @@ def analyze_gaps(client: Minio, object_name: str,
             logger.warning("Zero-dimension image for %s, skipping", object_name)
             return None
 
+        # --- Red scale-bar exclusion ---
+        # Red text/bar becomes dark in grayscale and triggers false-positive gaps.
+        # Detect red pixels in HSV (hue wraps: 0-10 and 160-180) and mark them
+        # as background so they are invisible to the thresholding step.
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        red_lo1 = np.array([0, 70, 50], dtype=np.uint8)
+        red_hi1 = np.array([10, 255, 255], dtype=np.uint8)
+        red_lo2 = np.array([160, 70, 50], dtype=np.uint8)
+        red_hi2 = np.array([180, 255, 255], dtype=np.uint8)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, red_lo1, red_hi1),
+            cv2.inRange(hsv, red_lo2, red_hi2),
+        )
+        # Dilate slightly to cover anti-aliased edges of the red text/bar
+        red_mask = cv2.dilate(
+            red_mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=2,
+        )
+
         # Dynamic noise floor: scales with image area so that microscopic noise
         # contours are suppressed proportionally on high-resolution images.
         # Uses the caller-provided min_area_param as the absolute floor.
@@ -193,6 +213,9 @@ def analyze_gaps(client: Minio, object_name: str,
         # Divide original by background: rock becomes ~255 (white), gaps
         # stay distinctly dark — lighting variations are erased.
         norm = cv2.divide(gray, bg, scale=255)
+
+        # Neutralise red scale-bar pixels so they read as background (white).
+        norm[red_mask > 0] = 255
 
         # Get Otsu's optimal threshold without applying it, then adjust
         # based on the sensitivity parameter (50 = baseline Otsu).
@@ -423,6 +446,21 @@ def generate_annotated_image(client: Minio, object_name: str):
             return None
 
         h_img, w_img = img.shape[:2]
+
+        # Red scale-bar exclusion (same logic as analyze_gaps)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, np.array([0, 70, 50], dtype=np.uint8),
+                             np.array([10, 255, 255], dtype=np.uint8)),
+            cv2.inRange(hsv, np.array([160, 70, 50], dtype=np.uint8),
+                             np.array([180, 255, 255], dtype=np.uint8)),
+        )
+        red_mask = cv2.dilate(
+            red_mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=2,
+        )
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         gray = cv2.bilateralFilter(gray, 9, 75, 75)
         small_gray = cv2.resize(gray, None, fx=0.1, fy=0.1,
@@ -431,6 +469,7 @@ def generate_annotated_image(client: Minio, object_name: str):
         small_bg = cv2.morphologyEx(small_gray, cv2.MORPH_CLOSE, bg_kernel)
         bg = cv2.resize(small_bg, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
         norm = cv2.divide(gray, bg, scale=255)
+        norm[red_mask > 0] = 255
         _, thresh = cv2.threshold(
             norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
         )
