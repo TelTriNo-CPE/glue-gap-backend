@@ -9,7 +9,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
+# Raise pixel limits BEFORE importing image libraries so that
+# high-resolution images (400 MB+) are not rejected as "decompression bombs".
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(pow(2, 40))
+
+import cv2  # noqa: E402
+import PIL.Image  # noqa: E402
+PIL.Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 import openpyxl
 import pyvips
