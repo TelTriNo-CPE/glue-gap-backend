@@ -19,7 +19,7 @@ export class UploadController {
   @Post('image')
   @HttpCode(HttpStatus.CREATED)
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 1024 * 1024 * 1024 } }))
-  uploadImage(@UploadedFile() file: Express.MulterS3.File) {
+  async uploadImage(@UploadedFile() file: Express.MulterS3.File) {
     if (!file) {
       throw new BadRequestException('No file provided. Use field name "file".');
     }

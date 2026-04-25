@@ -2,6 +2,7 @@ import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import {
   S3Client,
   HeadBucketCommand,
+  HeadObjectCommand,
   CreateBucketCommand,
   DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
@@ -43,13 +44,27 @@ export class UploadService implements OnModuleInit {
     await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
   }
 
-  buildResponse(file: Express.MulterS3.File) {
+  async buildResponse(file: Express.MulterS3.File) {
+    // multer-s3 relies on httpUploadProgress.total which is undefined for
+    // S3 multipart uploads, so file.size is often 0 for large files.
+    // Fall back to a HeadObject call to get the real size from MinIO.
+    let size = file.size;
+    if (!size && file.key) {
+      try {
+        const head = await this.s3.send(
+          new HeadObjectCommand({ Bucket: this.bucket, Key: file.key }),
+        );
+        size = head.ContentLength ?? 0;
+      } catch {
+        size = 0;
+      }
+    }
     return {
       originalName: file.originalname,
       key: file.key,
       bucket: file.bucket,
       location: file.location,
-      size: file.size,
+      size,
       contentType: file.mimetype,
     };
   }
