@@ -23,7 +23,8 @@ export class UploadController {
     if (!file) {
       throw new BadRequestException('No file provided. Use field name "file".');
     }
-    return this.uploadService.buildResponse(file);
+    const response = await this.uploadService.buildResponse(file);
+    return response;
   }
 
   @Delete('cancel/:key')

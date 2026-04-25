@@ -44,20 +44,26 @@ export class UploadService implements OnModuleInit {
     await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
   }
 
-  async buildResponse(file: Express.MulterS3.File) {
+  async buildResponse(
+    file: Express.MulterS3.File,
+  ): Promise<{ originalName: string; key: string; bucket: string; location: string; size: number; contentType: string }> {
     // multer-s3 relies on httpUploadProgress.total which is undefined for
     // S3 multipart uploads, so file.size is often 0 for large files.
-    // Fall back to a HeadObject call to get the real size from MinIO.
-    let size = file.size;
-    if (!size && file.key) {
-      try {
-        const head = await this.s3.send(
-          new HeadObjectCommand({ Bucket: this.bucket, Key: file.key }),
-        );
-        size = head.ContentLength ?? 0;
-      } catch {
-        size = 0;
-      }
+    // Always query MinIO for the authoritative object size.
+    let size: number = file.size ?? 0;
+    try {
+      const head = await this.s3.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: file.key }),
+      );
+      const s3Size = head.ContentLength ?? 0;
+      this.logger.log(
+        `Upload "${file.key}": multer reported ${file.size ?? 0} B, MinIO reports ${s3Size} B`,
+      );
+      if (s3Size > 0) size = s3Size;
+    } catch (err: any) {
+      this.logger.warn(
+        `HeadObject failed for "${file.key}": ${err?.message}`,
+      );
     }
     return {
       originalName: file.originalname,
