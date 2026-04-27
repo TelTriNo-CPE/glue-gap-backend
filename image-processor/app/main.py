@@ -125,39 +125,13 @@ def process_image(client: Minio, object_name: str):
 
 
 def analyze_gaps(client: Minio, object_name: str,
-                  sensitivity: float = 50.0, min_area_param: float = 20.0):
+                  sensitivity: float = 50.0, min_area_param: float = 20.0,
+                  bbox: BBoxModel | None = None):
     stem = Path(object_name).stem
     ext = Path(object_name).suffix.lower()
 
     if ext not in IMAGE_EXTENSIONS:
         return None
-
-    # Custom params → always re-run (no cache), default → use cache as before
-    use_cache = (sensitivity == 50.0 and min_area_param == 20.0)
-
-    if use_cache and result_exists(client, stem):
-        # Schema migration: invalidate cached results that are stale —
-        # missing 'coordinates' (pre-Phase 3) or missing 'version' (pre-v2,
-        # generated with the coarse 0.015 epsilon).
-        try:
-            cached = fetch_result(client, stem)
-            first_gap = (cached.get("gaps") or [{}])[0]
-            needs_refresh = (
-                "coordinates" not in first_gap
-                or cached.get("version", 0) < 10
-            )
-            if needs_refresh:
-                logger.info(
-                    "Cached result for %s is stale — re-analysing", stem
-                )
-                client.remove_object(BUCKET, f"results/{stem}.json")
-                # fall through to re-analyse
-            else:
-                logger.info("Gap analysis already exists for %s, skipping", stem)
-                return None
-        except Exception:
-            logger.info("Could not validate cached result for %s — re-analysing", stem)
-            # fall through to re-analyse
 
     logger.info("Analyzing gaps for %s — starting", object_name)
     t_start = time.time()
@@ -177,6 +151,36 @@ def analyze_gaps(client: Minio, object_name: str,
         if w == 0 or h == 0:
             logger.warning("Zero-dimension image for %s, skipping", object_name)
             return None
+
+        # Full image dimensions are always used for coordinate normalization
+        # so returned coordinates map back to the original image space.
+        full_w, full_h = w, h
+        bbox_x, bbox_y = 0, 0
+
+        # --- Bounding-box crop (object-select tool) ---
+        # If a bbox is provided, crop the image BEFORE detection so the
+        # pipeline runs only on the selected region.  Coordinates are
+        # re-offset after detection so they map to the full image.
+        if bbox is not None:
+            x1 = max(0, int(bbox.x))
+            y1 = max(0, int(bbox.y))
+            x2 = min(full_w, x1 + max(0, int(bbox.width)))
+            y2 = min(full_h, y1 + max(0, int(bbox.height)))
+            img = img[y1:y2, x1:x2]
+            h, w = img.shape[:2]
+            bbox_x, bbox_y = x1, y1
+            if w == 0 or h == 0:
+                logger.warning("Empty bbox crop for %s, returning no gaps", object_name)
+                return {
+                    "version": 10,
+                    "stem": stem,
+                    "image_size": {"width": full_w, "height": full_h},
+                    "gap_count": 0,
+                    "gaps": [],
+                    "radius_stats": None,
+                    "sensitivity": sensitivity,
+                    "min_area": min_area_param,
+                }
 
         # --- Red scale-bar exclusion ---
         # Red text/bar becomes dark in grayscale and triggers false-positive gaps.
@@ -277,18 +281,19 @@ def analyze_gaps(client: Minio, object_name: str,
                 cy = by + bh / 2.0
 
             # Flat normalized coordinate array [x1_norm, y1_norm, x2_norm, y2_norm, …]
-            # Normalised to [0, 1] so the frontend scales to any viewport without
-            # needing the original pixel dimensions; eliminates per-vertex JSON keys.
+            # Coordinates are offset by bbox_x/bbox_y (0 for full-image runs) so
+            # they map to the original full-image pixel space before normalization.
             pts = simplified.reshape(-1, 2)
             coordinates: list[float] = []
             for pt in pts:
-                coordinates.append(round(float(pt[0]) / w, 4))
-                coordinates.append(round(float(pt[1]) / h, 4))
+                coordinates.append(round((float(pt[0]) + bbox_x) / full_w, 4))
+                coordinates.append(round((float(pt[1]) + bbox_y) / full_h, 4))
 
             gaps.append({
                 "area_px":         round(area_px, 1),
                 "equiv_radius_px": round(equiv_radius_px, 2),
-                "centroid_norm":   [round(cx / w, 4), round(cy / h, 4)],
+                "centroid_norm":   [round((cx + bbox_x) / full_w, 4),
+                                    round((cy + bbox_y) / full_h, 4)],
                 "coordinates":     coordinates,
             })
 
@@ -318,13 +323,18 @@ def analyze_gaps(client: Minio, object_name: str,
         result = {
             "version":      10,                 # bump when pipeline changes
             "stem":         stem,
-            "image_size":   {"width": w, "height": h},
+            "image_size":   {"width": full_w, "height": full_h},
             "gap_count":    total_gap_count,   # all valid gaps, not capped
             "gaps":         payload_gaps,       # top GAP_PAYLOAD_LIMIT by area
             "radius_stats": radius_stats,       # stats over all valid gaps
             "sensitivity":  sensitivity,
             "min_area":     min_area_param,
         }
+
+        # Bbox-based (partial) analysis: never persist — the result covers only
+        # a sub-region and should not overwrite the full-image baseline.
+        if bbox is not None:
+            return result
 
         # Ensure we don't wipe existing saved manual gaps if this is a re-run.
         # The frontend will handle merging the auto-detected gaps with the existing ones.
@@ -644,10 +654,18 @@ def list_tiles():
     return {"tiles": stems}
 
 
+class BBoxModel(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+
 class AnalyzeRequest(BaseModel):
     key: str
     sensitivity: float = 50.0
     min_area: float = 20.0
+    bbox: BBoxModel | None = None
 
 
 class GapItem(BaseModel):
@@ -687,7 +705,7 @@ async def analyze_gaps_endpoint(body: AnalyzeRequest):
     try:
         result = await loop.run_in_executor(
             None, analyze_gaps, client, body.key,
-            body.sensitivity, body.min_area,
+            body.sensitivity, body.min_area, body.bbox,
         )
         if result is None:
             stem = Path(body.key).stem
