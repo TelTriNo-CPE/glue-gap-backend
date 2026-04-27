@@ -1,4 +1,4 @@
-import { Controller, Get, NotFoundException, Req, Res } from '@nestjs/common';
+import { Controller, Get, Head, NotFoundException, Req, Res } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { TilesService } from './tiles.service';
 
@@ -13,6 +13,7 @@ export class TilesController {
   }
 
   @Get('*')
+  @Head('*')
   async proxy(@Req() req: Request, @Res() res: Response) {
     // req.path = "/tiles/stem/stem.dzi" → strip leading "/" → "tiles/stem/stem.dzi"
     const minioKey = req.path.replace(/^\//, '');
