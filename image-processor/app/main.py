@@ -326,9 +326,15 @@ def analyze_gaps(client: Minio, object_name: str,
             "min_area":     min_area_param,
         }
 
-        # Only persist to MinIO when using default params (poll-loop / first run).
-        # Custom-param runs return results directly without overwriting the cache.
-        if use_cache:
+        # Ensure we don't wipe existing saved manual gaps if this is a re-run.
+        # The frontend will handle merging the auto-detected gaps with the existing ones.
+        # But we must persist a baseline if one doesn't exist so the frontend
+        # can PUT /results/:stem/gaps later (which expects the file to exist).
+        try:
+            fetch_result(client, stem)
+            # Result exists, we do NOT overwrite it.
+        except Exception:
+            # Result doesn't exist, safe to save this as the baseline.
             data = json.dumps(result).encode("utf-8")
             client.put_object(
                 BUCKET,
