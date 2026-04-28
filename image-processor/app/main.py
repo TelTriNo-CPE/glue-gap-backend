@@ -21,7 +21,8 @@ PIL.Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 import openpyxl
 import pyvips
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
@@ -592,17 +593,24 @@ async def poll_loop():
                     name = obj.object_name
                     if name.startswith(("tiles/", "results/", "exports/")):
                         continue
-                    dzi_fut = loop.run_in_executor(None, process_image, client, name)
-                    gap_fut = loop.run_in_executor(None, analyze_gaps, client, name)
-                    try:
-                        await dzi_fut
-                    except Exception:
-                        logger.exception("DZI error for %s", name)
-                    try:
-                        await gap_fut
-                    except Exception:
-                        logger.exception("Gap analysis error for %s", name)
-                    excel_fut = loop.run_in_executor(None, generate_excel, client, Path(name).stem)
+                    stem = Path(name).stem
+                    skip_dzi = dzi_exists(client, stem)
+                    skip_gap = result_exists(client, stem)
+                    if skip_dzi and skip_gap:
+                        continue
+                    if not skip_dzi:
+                        dzi_fut = loop.run_in_executor(None, process_image, client, name)
+                        try:
+                            await dzi_fut
+                        except Exception:
+                            logger.exception("DZI error for %s", name)
+                    if not skip_gap:
+                        gap_fut = loop.run_in_executor(None, analyze_gaps, client, name)
+                        try:
+                            await gap_fut
+                        except Exception:
+                            logger.exception("Gap analysis error for %s", name)
+                    excel_fut = loop.run_in_executor(None, generate_excel, client, stem)
                     try:
                         await excel_fut
                     except Exception:
@@ -654,6 +662,61 @@ def list_tiles():
         if stem:
             stems.append(stem)
     return {"tiles": stems}
+
+
+@app.api_route("/tiles/{filename:path}", methods=["GET", "HEAD"])
+def serve_tile(filename: str, request: Request):
+    """Stream DZI descriptor or tile images from MinIO.
+
+    Frontend requests:
+      HEAD/GET /tiles/{stem}.dzi          → tiles/{stem}/{stem}.dzi in MinIO
+      HEAD/GET /tiles/{stem}_files/{rest} → tiles/{stem}/{stem}_files/{rest} in MinIO
+    """
+    if filename.endswith(".dzi"):
+        stem = filename[:-4]
+        minio_key = f"tiles/{stem}/{stem}.dzi"
+        content_type = "application/xml"
+    elif "_files/" in filename:
+        stem = filename.split("_files/")[0]
+        minio_key = f"tiles/{stem}/{filename}"
+        content_type = "image/jpeg"
+    else:
+        raise HTTPException(status_code=404, detail=f"Unknown tile path: {filename}")
+
+    client = get_minio_client()
+
+    if request.method == "HEAD":
+        try:
+            stat = client.stat_object(BUCKET, minio_key)
+        except S3Error:
+            raise HTTPException(status_code=404, detail=f"Tile not found: {minio_key}")
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": content_type,
+                "Content-Length": str(stat.size),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
+
+    try:
+        minio_response = client.get_object(BUCKET, minio_key)
+    except S3Error:
+        raise HTTPException(status_code=404, detail=f"Tile not found: {minio_key}")
+
+    def _stream():
+        try:
+            for chunk in minio_response.stream(amt=65536):
+                yield chunk
+        finally:
+            minio_response.close()
+            minio_response.release_conn()
+
+    return StreamingResponse(
+        _stream(),
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 class BBoxModel(BaseModel):
