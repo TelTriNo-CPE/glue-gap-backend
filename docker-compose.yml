@@ -6,8 +6,8 @@ services:
       - "9090:9090"
       - "9091:9091"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
     networks:
@@ -24,14 +24,14 @@ services:
       context: ./api-gateway
       dockerfile: Dockerfile
     ports:
-      - "3030:3030"
+      - "${API_GATEWAY_PORT}:${API_GATEWAY_PORT}"
     environment:
-      PORT: 3030
-      MINIO_ENDPOINT: http://minio:9090
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: glue-analysis
-      IMAGE_PROCESSOR_URL: http://image-processor:8080
+      PORT: ${API_GATEWAY_PORT}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      IMAGE_PROCESSOR_URL: ${IMAGE_PROCESSOR_URL}
     depends_on:
       minio:
         condition: service_healthy
@@ -43,17 +43,17 @@ services:
       context: ./image-processor
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "${IMAGE_PROCESSOR_PORT}:${IMAGE_PROCESSOR_PORT}"
     volumes:
       # Bind-mount source so edits take effect on container restart (no rebuild needed)
       - ./image-processor/app:/app/app
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${IMAGE_PROCESSOR_PORT}", "--reload"]
     environment:
-      MINIO_ENDPOINT: minio
-      MINIO_PORT: 9090
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: glue-analysis
+      MINIO_ENDPOINT: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
     depends_on:
       minio:
         condition: service_healthy

@@ -15,8 +15,19 @@ export class TilesController {
   @Get('*')
   @Head('*')
   async proxy(@Req() req: Request, @Res() res: Response) {
-    // req.path = "/tiles/stem/stem.dzi" → strip leading "/" → "tiles/stem/stem.dzi"
-    const minioKey = req.path.replace(/^\//, '');
+    // req.path will be something like "/tiles/filename.dzi" or "/tiles/filename_files/..."
+    const path = req.path.replace(/^\/tiles\//, '');
+    let minioKey: string;
+
+    if (path.endsWith('.dzi')) {
+      const stem = path.replace('.dzi', '');
+      minioKey = `tiles/${stem}/${stem}.dzi`;
+    } else if (path.includes('_files/')) {
+      const stem = path.split('_files/')[0];
+      minioKey = `tiles/${stem}/${path}`;
+    } else {
+      minioKey = `tiles/${path}`;
+    }
 
     let body: NodeJS.ReadableStream;
     let contentType: string;
