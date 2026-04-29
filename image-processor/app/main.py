@@ -21,6 +21,26 @@ PIL.Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 import openpyxl
 import pyvips
+
+# Restrict pyvips memory behaviour BEFORE any image operations.
+#
+# By default pyvips caches every completed operation tile so it can reuse
+# results if the same pipeline is evaluated again.  On a 1 GB TIFF this
+# cache can silently retain the entire decompressed raster in RAM *after*
+# write_to_memory() returns, because pyvips does not know we will never
+# re-run the same pipeline.  Setting the limits to 0 disables caching
+# completely so memory is freed as soon as each strip is written out.
+#
+# concurrency_set(1) forces a single worker thread.  With the default
+# thread pool pyvips processes N strips simultaneously (one per thread),
+# each backed by a slice of the full-resolution source.  On a large image
+# this multiplies peak RAM by the thread count.  Single-threaded keeps
+# exactly one strip in flight at any moment.
+pyvips.cache_set_max(0)        # zero cached operation entries
+pyvips.cache_set_max_mem(0)    # zero bytes of cached pixel data
+pyvips.cache_set_max_files(0)  # zero cached open file handles
+pyvips.concurrency_set(1)      # one worker thread → one strip in RAM at a time
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from minio import Minio
@@ -169,19 +189,28 @@ def _load_for_analysis(
 
     # Materialise only the (small) analysis-resolution raster.
     # write_to_memory() triggers the lazy pyvips pipeline: it processes the
-    # source in strips, so peak RAM ≈ a few input strips + the output buffer.
-    np_rgb = np.ndarray(
-        buffer=img_v.write_to_memory(),
-        dtype=np.uint8,
-        shape=(img_v.height, img_v.width, 3),
-    ).copy()  # .copy() releases the pyvips internal buffer immediately
-
-    # pyvips gives RGB order; OpenCV expects BGR.
-    bgr = np_rgb[:, :, ::-1].copy()
+    # source in strips (one at a time with concurrency=1), so peak RAM during
+    # evaluation ≈ one_source_strip + output_buffer.
+    #
+    # Buffer ownership must be explicit:
+    #   raw_buf  — the bytes object returned by pyvips (output-size only)
+    #   np_rgb   — a zero-copy numpy *view* into raw_buf (no extra allocation)
+    #   bgr      — one owned numpy copy with channels reversed
+    # We then del both np_rgb and raw_buf so the pyvips allocation is freed
+    # before we hand the array to OpenCV.  The old pattern of
+    #   np.ndarray(buffer=write_to_memory(), ...).copy()
+    # kept raw_buf alive until the GC collected the anonymous ndarray, meaning
+    # write_to_memory_result + np_rgb_copy + bgr_copy were all resident at once
+    # (3× the output size).  The explicit del below keeps peak at 2×.
+    out_h, out_w = img_v.height, img_v.width
+    raw_buf = img_v.write_to_memory()
+    np_rgb  = np.frombuffer(raw_buf, dtype=np.uint8).reshape(out_h, out_w, 3)
+    bgr     = np_rgb[:, :, ::-1].copy()  # one owned allocation; channels R↔B swapped
+    del np_rgb, raw_buf                  # release pyvips buffer before OpenCV pipeline
 
     logger.info(
         "_load_for_analysis: orig=%dx%d  roi=%dx%d  out=%dx%d  scale=%.4f",
-        orig_w, orig_h, roi_w, roi_h, img_v.width, img_v.height, scale,
+        orig_w, orig_h, roi_w, roi_h, out_w, out_h, scale,
     )
     return bgr, orig_w, orig_h, bbox_x, bbox_y, scale
 
