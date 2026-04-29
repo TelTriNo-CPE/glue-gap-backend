@@ -39,7 +39,10 @@ import pyvips
 pyvips.cache_set_max(0)        # zero cached operation entries
 pyvips.cache_set_max_mem(0)    # zero bytes of cached pixel data
 pyvips.cache_set_max_files(0)  # zero cached open file handles
-pyvips.concurrency_set(1)      # one worker thread → one strip in RAM at a time
+# Concurrency is set to 1 via VIPS_CONCURRENCY=1 in the Dockerfile ENV so
+# that libvips processes exactly one strip at a time, preventing parallel
+# strip buffers from multiplying peak RAM.  pyvips has no Python-level API
+# for this — the env-var approach is the supported method.
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
