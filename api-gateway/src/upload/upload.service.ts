@@ -5,6 +5,8 @@ import {
   HeadObjectCommand,
   CreateBucketCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
+  ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 
 @Injectable()
@@ -42,6 +44,51 @@ export class UploadService implements OnModuleInit {
 
   async cancelUpload(key: string): Promise<void> {
     await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  async cleanupStem(stem: string): Promise<void> {
+    // Collect all object keys associated with this stem across every prefix.
+    const prefixes = [
+      stem,               // original image: ${stem}.jpg / .png / etc.
+      `tiles/${stem}/`,   // DZI descriptor + tile images
+      `exports/${stem}`,  // ${stem}.xlsx and ${stem}-annotated.jpg
+    ];
+
+    const keys: string[] = [
+      `results/${stem}.json`, // fixed key — always included
+    ];
+
+    for (const prefix of prefixes) {
+      let continuationToken: string | undefined;
+      do {
+        const res = await this.s3.send(
+          new ListObjectsV2Command({
+            Bucket: this.bucket,
+            Prefix: prefix,
+            ContinuationToken: continuationToken,
+          }),
+        );
+        for (const obj of res.Contents ?? []) {
+          if (obj.Key) keys.push(obj.Key);
+        }
+        continuationToken = res.NextContinuationToken;
+      } while (continuationToken);
+    }
+
+    if (keys.length === 0) return;
+
+    // AWS batch delete accepts at most 1 000 keys per request.
+    for (let i = 0; i < keys.length; i += 1000) {
+      const batch = keys.slice(i, i + 1000);
+      await this.s3.send(
+        new DeleteObjectsCommand({
+          Bucket: this.bucket,
+          Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true },
+        }),
+      );
+    }
+
+    this.logger.log(`Cleanup complete for stem "${stem}" (${keys.length} object(s) deleted)`);
   }
 
   async buildResponse(

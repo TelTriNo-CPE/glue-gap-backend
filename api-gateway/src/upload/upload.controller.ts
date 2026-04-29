@@ -32,4 +32,10 @@ export class UploadController {
   async cancelUpload(@Param('key') key: string) {
     await this.uploadService.cancelUpload(key);
   }
+
+  @Delete('cleanup/:stem')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async cleanupStem(@Param('stem') stem: string) {
+    await this.uploadService.cleanupStem(stem);
+  }
 }
