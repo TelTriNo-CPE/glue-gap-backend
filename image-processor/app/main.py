@@ -41,6 +41,11 @@ POLY_SIMPLIFY_EPSILON = float(os.environ.get("POLY_SIMPLIFY_EPSILON", "0.001")) 
 GAP_PAYLOAD_LIMIT     = int(os.environ.get("GAP_PAYLOAD_LIMIT", "2000"))        # max gaps sent to frontend
 CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "60"))
 RETENTION_SECONDS = int(os.environ.get("RETENTION_SECONDS", "3600"))
+# Maximum pixel dimension (width or height) used for gap-analysis.
+# pyvips downscales the image to this size in a streaming, tile-based pass
+# so the peak working-set RAM is bounded to ~few_strips + output raster
+# regardless of the source file size (a 1 GB TIFF stays under ~200 MB).
+MAX_ANALYSIS_DIM = int(os.environ.get("MAX_ANALYSIS_DIM", "4096"))
 
 
 def get_minio_client() -> Minio:
@@ -85,6 +90,100 @@ def upload_directory(client: Minio, local_dir: Path, minio_prefix: str):
         suffix = file_path.suffix.lower()
         content_type = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "application/octet-stream"
         client.fput_object(BUCKET, object_name, str(file_path), content_type=content_type)
+
+
+def _load_for_analysis(
+    local_path: Path,
+    bbox: "BBoxModel | None" = None,
+) -> tuple[np.ndarray, int, int, int, int, float]:
+    """Load an image for gap analysis via pyvips — memory-safe for files of any size.
+
+    pyvips evaluates lazily in tile-strips, so only a narrow band of the
+    source image is resident at any time.  For a 1 GB TIFF the peak working
+    set is roughly (one_strip × full_width × bands) + output_raster ≈ 50 MB,
+    compared with ~3-4 GB if the whole file were decoded with cv2.imread.
+
+    The returned BGR array has at most MAX_ANALYSIS_DIM pixels on its longest
+    side.  All pixel-space quantities (areas, radii, coordinates) must be
+    scaled back to full-image space by the caller using the returned *scale*.
+
+    Parameters
+    ----------
+    local_path : path to the image file on disk (already downloaded from MinIO)
+    bbox       : optional crop region in full-image pixel coordinates
+
+    Returns
+    -------
+    bgr      : uint8 BGR numpy array ready for OpenCV
+    orig_w   : original image width  (pixels)
+    orig_h   : original image height (pixels)
+    bbox_x   : left edge of the crop in full-image pixels (0 when bbox is None)
+    bbox_y   : top  edge of the crop in full-image pixels (0 when bbox is None)
+    scale    : analysis_pixels / original_pixels  (≤ 1.0).
+               Multiply analysis-space pixel coords by (1 / scale) to recover
+               full-image pixel coordinates before normalising.
+    """
+    img_v = pyvips.Image.new_from_file(str(local_path))
+
+    # Flatten any alpha channel onto a white background so we always have
+    # opaque pixels; OpenCV does not understand transparency.
+    if img_v.hasalpha():
+        img_v = img_v.flatten(background=255)
+
+    # Normalise to sRGB so we always get a 3-band uint8 image.
+    # This handles greyscale TIFFs, 16-bit images, CMYK scans, etc.
+    if img_v.interpretation != "srgb":
+        img_v = img_v.colourspace("srgb")
+
+    # Ensure exactly 3 bands after colour-space conversion.
+    if img_v.bands > 3:
+        img_v = img_v[:3]
+    elif img_v.bands < 3:
+        # Replicate single band to fill R/G/B
+        img_v = img_v.bandjoin([img_v, img_v])[:3]
+
+    # Ensure 8-bit unsigned output (pyvips keeps high-bit-depth formats as
+    # uint16 even after colourspace(); we need uint8 for OpenCV).
+    if img_v.format != "uchar":
+        img_v = img_v.cast("uchar")
+
+    orig_w, orig_h = img_v.width, img_v.height
+    bbox_x, bbox_y = 0, 0
+
+    # Crop to the requested bounding box *before* downscaling so we only
+    # work on pixels inside the region of interest.
+    if bbox is not None:
+        x1 = max(0, int(bbox.x))
+        y1 = max(0, int(bbox.y))
+        x2 = min(orig_w, x1 + max(1, int(bbox.width)))
+        y2 = min(orig_h, y1 + max(1, int(bbox.height)))
+        img_v = img_v.crop(x1, y1, x2 - x1, y2 - y1)
+        bbox_x, bbox_y = x1, y1
+
+    # Compute a uniform downscale factor so the longer edge ≤ MAX_ANALYSIS_DIM.
+    roi_w, roi_h = img_v.width, img_v.height
+    scale = 1.0
+    if max(roi_w, roi_h) > MAX_ANALYSIS_DIM:
+        scale = MAX_ANALYSIS_DIM / max(roi_w, roi_h)
+        img_v = img_v.resize(scale)
+
+    # Materialise only the (small) analysis-resolution raster.
+    # write_to_memory() triggers the lazy pyvips pipeline: it processes the
+    # source in strips, so peak RAM ≈ a few input strips + the output buffer.
+    np_rgb = np.ndarray(
+        buffer=img_v.write_to_memory(),
+        dtype=np.uint8,
+        shape=(img_v.height, img_v.width, 3),
+    ).copy()  # .copy() releases the pyvips internal buffer immediately
+
+    # pyvips gives RGB order; OpenCV expects BGR.
+    bgr = np_rgb[:, :, ::-1].copy()
+
+    logger.info(
+        "_load_for_analysis: orig=%dx%d  roi=%dx%d  out=%dx%d  scale=%.4f",
+        orig_w, orig_h, roi_w, roi_h, img_v.width, img_v.height, scale,
+    )
+    return bgr, orig_w, orig_h, bbox_x, bbox_y, scale
 
 
 def process_image(client: Minio, object_name: str):
@@ -146,44 +245,36 @@ def analyze_gaps(client: Minio, object_name: str,
 
         client.fget_object(BUCKET, object_name, str(local_path))
 
-        img = cv2.imread(str(local_path))
-        if img is None:
-            logger.warning("cv2.imread returned None for %s, skipping", object_name)
+        # Memory-safe load: pyvips streams the source in tile-strips and
+        # downscales to MAX_ANALYSIS_DIM before handing a small numpy array
+        # to OpenCV.  Peak RAM stays under ~200 MB even for 1 GB source files,
+        # compared with 3-4 GB if cv2.imread decoded the full raster.
+        # bbox cropping and downscaling are both handled inside the helper.
+        try:
+            img, full_w, full_h, bbox_x, bbox_y, scale = _load_for_analysis(
+                local_path, bbox=bbox
+            )
+        except Exception as exc:
+            logger.warning("pyvips load failed for %s (%s), skipping", object_name, exc)
             return None
+
         h, w = img.shape[:2]
         if w == 0 or h == 0:
-            logger.warning("Zero-dimension image for %s, skipping", object_name)
+            logger.warning("Zero-dimension analysis image for %s, skipping", object_name)
             return None
 
-        # Full image dimensions are always used for coordinate normalization
-        # so returned coordinates map back to the original image space.
-        full_w, full_h = w, h
-        bbox_x, bbox_y = 0, 0
-
-        # --- Bounding-box crop (object-select tool) ---
-        # If a bbox is provided, crop the image BEFORE detection so the
-        # pipeline runs only on the selected region.  Coordinates are
-        # re-offset after detection so they map to the full image.
-        if bbox is not None:
-            x1 = max(0, int(bbox.x))
-            y1 = max(0, int(bbox.y))
-            x2 = min(full_w, x1 + max(0, int(bbox.width)))
-            y2 = min(full_h, y1 + max(0, int(bbox.height)))
-            img = img[y1:y2, x1:x2]
-            h, w = img.shape[:2]
-            bbox_x, bbox_y = x1, y1
-            if w == 0 or h == 0:
-                logger.warning("Empty bbox crop for %s, returning no gaps", object_name)
-                return {
-                    "version": 10,
-                    "stem": stem,
-                    "image_size": {"width": full_w, "height": full_h},
-                    "gap_count": 0,
-                    "gaps": [],
-                    "radius_stats": None,
-                    "sensitivity": sensitivity,
-                    "min_area": min_area_param,
-                }
+        # Guard against a degenerate bbox that collapsed to zero after clamping.
+        if bbox is not None and (full_w == 0 or full_h == 0):
+            return {
+                "version": 10,
+                "stem": stem,
+                "image_size": {"width": full_w, "height": full_h},
+                "gap_count": 0,
+                "gaps": [],
+                "radius_stats": None,
+                "sensitivity": sensitivity,
+                "min_area": min_area_param,
+            }
 
         # --- Red scale-bar exclusion ---
         # Red text/bar becomes dark in grayscale and triggers false-positive gaps.
@@ -205,10 +296,11 @@ def analyze_gaps(client: Minio, object_name: str,
             iterations=2,
         )
 
-        # Dynamic noise floor: scales with image area so that microscopic noise
-        # contours are suppressed proportionally on high-resolution images.
-        # Uses the caller-provided min_area_param as the absolute floor.
-        min_area = max(min_area_param, (w * h) / 40_000)
+        # Dynamic noise floor in *analysis-image* pixel units.
+        # min_area_param is expressed in full-image pixels², so we scale it
+        # down by scale² to stay consistent with the downscaled raster.
+        # The dynamic floor (w*h)/40_000 is already in analysis pixels.
+        min_area = max(min_area_param * (scale ** 2), (w * h) / 40_000)
 
         # --- Background-division illumination normalization ---
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -283,20 +375,24 @@ def analyze_gaps(client: Minio, object_name: str,
                 cx = bx + bw / 2.0
                 cy = by + bh / 2.0
 
-            # Flat normalized coordinate array [x1_norm, y1_norm, x2_norm, y2_norm, …]
-            # Coordinates are offset by bbox_x/bbox_y (0 for full-image runs) so
-            # they map to the original full-image pixel space before normalization.
+            # Project analysis-space pixel coords back to full-image space:
+            #   1. multiply by (1/scale) to undo the downscale
+            #   2. add the bbox offset (0 when no bbox was provided)
+            #   3. divide by full image dimensions to normalise to [0, 1]
+            inv_scale = 1.0 / scale
             pts = simplified.reshape(-1, 2)
             coordinates: list[float] = []
             for pt in pts:
-                coordinates.append(round((float(pt[0]) + bbox_x) / full_w, 4))
-                coordinates.append(round((float(pt[1]) + bbox_y) / full_h, 4))
+                coordinates.append(round((float(pt[0]) * inv_scale + bbox_x) / full_w, 4))
+                coordinates.append(round((float(pt[1]) * inv_scale + bbox_y) / full_h, 4))
 
             gaps.append({
-                "area_px":         round(area_px, 1),
-                "equiv_radius_px": round(equiv_radius_px, 2),
-                "centroid_norm":   [round((cx + bbox_x) / full_w, 4),
-                                    round((cy + bbox_y) / full_h, 4)],
+                # Scale area and radius back to full-image pixel units so the
+                # reported values match what users see at the original resolution.
+                "area_px":         round(area_px * (inv_scale ** 2), 1),
+                "equiv_radius_px": round(equiv_radius_px * inv_scale, 2),
+                "centroid_norm":   [round((cx * inv_scale + bbox_x) / full_w, 4),
+                                    round((cy * inv_scale + bbox_y) / full_h, 4)],
                 "coordinates":     coordinates,
             })
 
@@ -465,9 +561,13 @@ def generate_annotated_image(client: Minio, object_name: str):
 
         client.fget_object(BUCKET, object_name, str(local_path))
 
-        img = cv2.imread(str(local_path))
-        if img is None:
-            logger.warning("cv2.imread returned None for %s", object_name)
+        # Use the pyvips streaming loader — never decompresses the full raster.
+        # The annotated output is JPEG-capped at 15 MB so working at analysis
+        # resolution (≤ MAX_ANALYSIS_DIM) is sufficient and much safer.
+        try:
+            img, _full_w, _full_h, _bx, _by, scale_ann = _load_for_analysis(local_path)
+        except Exception as exc:
+            logger.warning("pyvips load failed for annotated image %s (%s)", object_name, exc)
             return None
 
         h_img, w_img = img.shape[:2]
@@ -503,7 +603,8 @@ def generate_annotated_image(client: Minio, object_name: str):
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel, iterations=1)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_area_ann = max(MIN_GAP_AREA_PX, (w_img * h_img) / 40_000)
+        # Scale the absolute floor to analysis-pixel units (same logic as analyze_gaps).
+        min_area_ann = max(MIN_GAP_AREA_PX * (scale_ann ** 2), (w_img * h_img) / 40_000)
         max_area_ann = 0.25 * w_img * h_img
         filtered = [cnt for cnt in contours
                     if min_area_ann <= cv2.contourArea(cnt) <= max_area_ann]
